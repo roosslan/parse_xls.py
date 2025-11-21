@@ -1,2 +1,2 @@
 # parse_xls.py
-A python script to parse and XLS file
+A python script to parse an XLS file
