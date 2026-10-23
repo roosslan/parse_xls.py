@@ -1,92 +1,112 @@
-#1. Entferne non DEV/CPP Services
-#2. Lösche Übersicht Seite
-#3. Speichern als xls
-#4. Konvertieren xls to xlsx
-#5. Speichern als \Developers\b-end
+"""Еженедельная статистика по DEV-сервисам.
 
-import openpyxl, win32com.client, calendar, pandas as pd, datetime as dt
-from datetime import datetime
+Порядок работы:
+1. Обновление внешних запросов в «Statistik Loader.xlsx» через Excel (COM).
+2. Чтение листа «Quelldaten», удаление закрытых заявок и заявок не из очередей DEV.
+3. Подсчёт заявок по сервисам [T000] DEV::*.
+4. Сохранение результата (листы «Quelldaten» и «T000») в сетевую директорию
+   под именем ДД.ММ.ГГГГ.xlsx.
+5. Подготовка письма в Outlook (окно открывается для проверки перед отправкой).
+"""
+
 from datetime import date
+from pathlib import Path
 
-xlapp = win32com.client.DispatchEx("Excel.Application")
-print('Aktualisierung xlsx...')
-wbr = xlapp.Workbooks.Open('C:\Documents\Statistik Loader.xlsx')
-wbr.RefreshAll()
-xlapp.CalculateUntilAsyncQueriesDone()
-wbr.Save()
-print('Aktualisierung ist fertig.')
-xlapp.Quit()
+import pandas as pd
 
-print('Lesen die xlsx Datei...')
+# Пути заданы через raw-строки: в обычных строках «\b» превращается в backspace,
+# а «\'» экранирует кавычку (из-за этого исходный скрипт не компилировался).
+QUELLE = Path(r'C:\Documents\Statistik Loader.xlsx')
+ZIEL_DIR = Path(r'\\0x2srv\DFS-Abteilungen$\Developers\b-end')
+ZIEL_DIR_LAUFWERK = r'S:\Developers\b-end'  # тот же путь через подключённый диск, для письма
+EMPFAENGER = 'ruslan@0x22222222.com'
 
-df = pd.read_excel('Statistik Loader.xlsx', 'Quelldaten', index_col=None, na_values=['NA'])
+QUELL_BLATT = 'Quelldaten'
+ERGEBNIS_BLATT = 'T000'
+DEV_QUEUES = ['[1] Second Level::DEV', '[2] Third Level::DEV']
+# Столбец I листа «Quelldaten» (9-й, индекс 8) — сервис заявки
+DIENST_SPALTE_INDEX = 8
 
-df = df.drop(df[(df['State'] == 'closed')].index)
-df = df.drop(df[(df['Queue'] != '[1] Second Level::DEV') & (df['Queue'] != '[2] Third Level::DEV')].index)
-print('Reinigung xlsx...')
+DIENST_PREFIX = '[T000] DEV::'
+DIENSTE = ['CPP', 'JIT', 'JAVA-Entwicklung', 'Python', 'Logistik',
+           'EDI-Mapping', 'EDI', 'B1-2', 'System', 'TP']
 
-writer = pd.ExcelWriter('Statistik.xlsx')
-df.to_excel(writer, 'Quelldaten', index=False)
-writer.save()
+# calendar.month_name зависит от локали (обычно английская) — нужны немецкие названия
+MONATE = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli',
+          'August', 'September', 'Oktober', 'November', 'Dezember']
 
-print('Reinigung ist fertig.')
 
-Woerterbuch = { 
-				'CPP': 0,
-				'JIT': 0,
-				'JAVA-Entwicklung': 0,
-				'Python': 0,
-				'Logistik': 0,
-				'EDI-Mapping': 0,
-				'EDI': 0,
-				'B1-2': 0,
-				'System': 0,
-				'TP': 0  }
-			
-Dienste = { '[T000] DEV::JIT': 0 }			
+def excel_aktualisieren(pfad: Path) -> None:
+    """Обновляет все запросы книги и сохраняет её; Excel закрывается при любой ошибке."""
+    import win32com.client
 
-for Wort in Woerterbuch:
-	Wort = '[T000] DEV::' + Wort
-	Dienste[Wort] = 0
+    xlapp = win32com.client.DispatchEx('Excel.Application')
+    xlapp.DisplayAlerts = False
+    try:
+        wb = xlapp.Workbooks.Open(str(pfad))
+        try:
+            wb.RefreshAll()
+            xlapp.CalculateUntilAsyncQueriesDone()
+            wb.Save()
+        finally:
+            wb.Close(SaveChanges=False)
+    finally:
+        xlapp.Quit()
 
-class switch(object):
-    value = None
-    def __new__(class_, value):
-        class_.value = value
-        return True
 
-def case(*args):
-    return any((arg == switch.value for arg in args))
+def daten_filtern(df: pd.DataFrame) -> pd.DataFrame:
+    """Оставляет только открытые заявки из очередей DEV."""
+    maske = (df['State'] != 'closed') & df['Queue'].isin(DEV_QUEUES)
+    return df[maske]
 
-wb = openpyxl.load_workbook('Statistik.xlsx')
 
-ws = wb['Quelldaten']
+def dienste_zaehlen(df: pd.DataFrame) -> pd.DataFrame:
+    """Считает заявки по каждому сервису; сервисы без заявок получают 0."""
+    namen = [DIENST_PREFIX + d for d in DIENSTE]
+    spalte = df.iloc[:, DIENST_SPALTE_INDEX].astype(str)
+    anzahl = spalte.value_counts().reindex(namen, fill_value=0)
+    return pd.DataFrame({'Dienst': namen, 'Anzahl': anzahl.to_numpy()})
 
-print('Kalkulation...')
-  
-for cell in ws['I']:
-	if str(cell.value) in Dienste:
-		Dienste [str(cell.value)] += 1
 
-ws = wb.create_sheet('T000')
+def speichern(df: pd.DataFrame, zaehlung: pd.DataFrame, ziel: Path) -> None:
+    with pd.ExcelWriter(ziel, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name=QUELL_BLATT, index=False)
+        zaehlung.to_excel(writer, sheet_name=ERGEBNIS_BLATT, index=False, header=False)
 
-i = 0
-for dienstName in Dienste:
-	i += 1
-	ws.cell(row=i, column=1).value = dienstName
-	ws.cell(row=i, column=2).value = Dienste[dienstName]
 
-currentdate = datetime.today().strftime('%d.%m.%Y')
-wb.save('\\0x2srv\DFS-Abteilungen$\Developers\b-end\' + currentdate + '.xlsx')
-print('File \\0x2srv\DFS-Abteilungen$\Developers\b-end\' + currentdate + '.xlsx ist gespeichert.')
-d,m,y = currentdate.split('.')
+def mail_vorbereiten(dateiname: str, heute: date) -> None:
+    import win32com.client
 
-woche = dt.date(int(y),int(m),int(d)).strftime("%V")
-monat = calendar.month_name[int(m)]
+    woche = heute.isocalendar().week
+    outlook = win32com.client.Dispatch('Outlook.Application')
+    mail = outlook.CreateItem(0)
+    mail.To = EMPFAENGER
+    mail.Subject = f'Die Liste Woche #{woche:02d}, {MONATE[heute.month - 1]}'
+    mail.HTMLBody = (f'Hallo,<br>die Datei {ZIEL_DIR_LAUFWERK}\\{dateiname} ist fertig.<br><br>'
+                     'Viele Grüße<br>')
+    mail.Display(True)
 
-outlook = win32com.client.Dispatch('outlook.application')
-mail = outlook.CreateItem(0)
-mail.To = 'ruslan@0x22222222.com'
-mail.Subject = 'Die Liste Woche #' + woche + ', ' + monat
-mail.HtmlBody = 'Hallo, die Datei S:\Developers\b-end\\' + currentdate + '.xlsx ist fertig. \\r\\n Viele Grüße \\r\\n'
-mail.Display(True)
+
+def main() -> None:
+    print('Aktualisierung xlsx...')
+    excel_aktualisieren(QUELLE)
+    print('Aktualisierung ist fertig.')
+
+    print('Lesen die xlsx Datei...')
+    df = pd.read_excel(QUELLE, sheet_name=QUELL_BLATT, na_values=['NA'])
+
+    print('Reinigung und Kalkulation...')
+    df = daten_filtern(df)
+    zaehlung = dienste_zaehlen(df)
+
+    heute = date.today()
+    dateiname = heute.strftime('%d.%m.%Y') + '.xlsx'
+    ziel = ZIEL_DIR / dateiname
+    speichern(df, zaehlung, ziel)
+    print(f'Datei {ziel} ist gespeichert.')
+
+    mail_vorbereiten(dateiname, heute)
+
+
+if __name__ == '__main__':
+    main()
