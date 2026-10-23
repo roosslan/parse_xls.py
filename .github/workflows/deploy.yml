@@ -1,0 +1,71 @@
+# Проверка и развёртывание parse_xls.py.
+# test   — на каждый push и pull request, на GitHub-hosted Windows.
+# deploy — только после push в trunk или ручного запуска; выполняется в environment
+#          «production» на self-hosted Windows runner рабочей машины, где есть Excel и Outlook.
+name: Test & Deploy
+
+on:
+  push:
+    branches: [trunk]
+  pull_request:
+    branches: [trunk]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+
+  deploy:
+    needs: test
+    # Из pull request (в том числе из форков) деплой не запускается
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/trunk'
+    runs-on: [self-hosted, windows]
+    environment:
+      name: production
+    defaults:
+      run:
+        shell: powershell
+    env:
+      DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Проверка настроек
+        run: |
+          if (-not $env:DEPLOY_DIR) {
+            Write-Error 'Переменная DEPLOY_DIR environment production не задана'
+            exit 1
+          }
+
+      - name: Копирование файлов
+        run: |
+          New-Item -ItemType Directory -Force $env:DEPLOY_DIR | Out-Null
+          Copy-Item parse_xls.py, requirements.txt -Destination $env:DEPLOY_DIR -Force
+
+      - name: Установка зависимостей
+        run: |
+          $venv = Join-Path $env:DEPLOY_DIR '.venv'
+          if (-not (Test-Path $venv)) { python -m venv $venv }
+          & (Join-Path $venv 'Scripts\python.exe') -m pip install --upgrade -r (Join-Path $env:DEPLOY_DIR 'requirements.txt')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Проверка импорта
+        run: |
+          & (Join-Path $env:DEPLOY_DIR '.venv\Scripts\python.exe') -c "import sys; sys.path.insert(0, r'$env:DEPLOY_DIR'); import parse_xls, win32com.client"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
